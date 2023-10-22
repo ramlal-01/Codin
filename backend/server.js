@@ -7,14 +7,20 @@ const app = express();
 app.use(cors());
 
 const server = http.createServer(app);
+
+const CORS_ORIGIN = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(',')
+  : ['http://localhost:5173'];
+
+
 const io = new Server(server, {
   cors: {
-    origin: 'http://localhost:5173',
+    origin: CORS_ORIGIN,
     methods: ['GET', 'POST']
   }
 });
 
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
 
 io.on('connection', (socket) => {
   console.log('New client connected:', socket.id);
@@ -32,8 +38,8 @@ io.on('connection', (socket) => {
   })
 
   socket.on('chat-message', ({ roomId, message }) => {
-    socket.to(roomId).emit('chat-message', message)
-  })
+  socket.to(roomId).emit('chat-message', message)
+})
 
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
