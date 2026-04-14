@@ -5,3 +5,7 @@ backend/package-lock.json
 frontend/package-lock.json
 
 .env
+
+docs/Core Features.docx
+docs/why should i make this.docx
+        
