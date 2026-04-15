@@ -7,7 +7,11 @@ const axios = require('axios');
 
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: process.env.CORS_ORIGIN?.split(","),
+  credentials: true
+}));
+
 
 const JUDGE0_BASE_URL = process.env.SANDBOX_BASE_URL || 'https://ce.judge0.com';
 const JUDGE0_API_KEY = process.env.SANDBOX_API_KEY || '';
