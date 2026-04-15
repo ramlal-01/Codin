@@ -1,14 +1,18 @@
 import { useEffect, useState } from 'react'
 import { io, Socket } from 'socket.io-client'
 
-const SERVER_URL = 'http://localhost:5000'
+// Read from env, fall back to localhost for dev
+const SERVER_URL =
+  import.meta.env.VITE_SERVER_URL ?? 'http://localhost:5000'
 
 export function useSocket(roomId: string, username: string) {
   const [socket, setSocket] = useState<Socket | null>(null)
   const [connected, setConnected] = useState(false)
 
   useEffect(() => {
-    const socketInstance = io(SERVER_URL)
+    const socketInstance = io(SERVER_URL, {
+      withCredentials: true, // keep if you use cookies/sessions; otherwise you can remove
+    })
 
     socketInstance.on('connect', () => {
       console.log('Connected to server:', socketInstance.id)
