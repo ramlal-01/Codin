@@ -10,9 +10,7 @@ export function useSocket(roomId: string, username: string) {
   const [connected, setConnected] = useState(false)
 
   useEffect(() => {
-    const socketInstance = io(SERVER_URL, {
-      withCredentials: true, // keep if you use cookies/sessions; otherwise you can remove
-    })
+    const socketInstance = io(SERVER_URL);
 
     socketInstance.on('connect', () => {
       console.log('Connected to server:', socketInstance.id)
