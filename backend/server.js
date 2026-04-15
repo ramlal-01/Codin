@@ -38,8 +38,9 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN
 
 const io = new Server(server, {
   cors: {
-    origin: CORS_ORIGIN,
-    methods: ['GET', 'POST'],
+    origin: process.env.CORS_ORIGIN?.split(","),
+    methods: ["GET", "POST"],
+    credentials: true    
   },
 });
 
