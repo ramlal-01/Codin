@@ -1,95 +1,245 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const cors = require('cors');
-require('dotenv').config();
-const axios = require('axios');
+const express = require("express");
+const http = require("http");
+const cors = require("cors");
+const dotenv = require("dotenv");
+const jwt = require("jsonwebtoken");
+const mongoose = require("mongoose");
+const { Server } = require("socket.io");
 
+const authRoutes = require("./routes/auth");
+const roomRoutes = require("./routes/rooms");
+const chatRoutes = require("./routes/chat");
+const whiteboardRoutes = require("./routes/whiteboard");
+const { executeCode } = require("./services/codeExecution");
+const ChatMessage = require("./models/ChatMessage");
+const Room = require("./models/Room");
+const User = require("./models/User");
+const Whiteboard = require("./models/Whiteboard");
+
+dotenv.config();
 
 const app = express();
-app.use(cors({
-  origin: process.env.CORS_ORIGIN?.split(","),
-  credentials: true
-}));
-
-
-const JUDGE0_BASE_URL = process.env.SANDBOX_BASE_URL || 'https://ce.judge0.com';
-const JUDGE0_API_KEY = process.env.SANDBOX_API_KEY || '';
-
-// Map from your dropdown values to Judge0 language IDs
-// IDs from Judge0 docs (can be adjusted/extended later).[web:36]
-const languageMap = {
-  javascript: 63, // Node.js
-  typescript: 93, // Node.js (TypeScript)
-  python: 71,     // Python 3
-  java: 62,       // Java (OpenJDK)
-  cpp: 54,        // C++ (GCC)
-  c: 50,          // C (GCC)
-  html: 63,       // Often run as JS, or handle separately later
-  css: 63,        // Same note as html
-};
-
-
 const server = http.createServer(app);
-
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || "dev-only-change-me";
 const CORS_ORIGIN = process.env.CORS_ORIGIN
-  ? process.env.CORS_ORIGIN.split(',')
-  : ['http://localhost:5173'];
+  ? process.env.CORS_ORIGIN.split(",")
+  : ["http://localhost:5173"];
+
+app.use(
+  cors({
+    origin: CORS_ORIGIN,
+    credentials: true,
+  })
+);
+app.use(express.json({ limit: "2mb" }));
+
+app.get("/", (req, res) => {
+  res.json({ message: "CodIn backend is running" });
+});
+
+app.use("/api/auth", authRoutes);
+app.use("/api/rooms", roomRoutes);
+app.use("/api/chat", chatRoutes);
+app.use("/api/whiteboards", whiteboardRoutes);
 
 const io = new Server(server, {
   cors: {
-    origin: process.env.CORS_ORIGIN?.split(","),
+    origin: CORS_ORIGIN,
     methods: ["GET", "POST"],
-    credentials: true    
+    credentials: true,
   },
 });
 
-const PORT = process.env.PORT || 5000;
-
-// roomId -> Map<socketId, username>
 const roomUsers = new Map();
+const whiteboardSaveTimers = new Map();
 
-io.on('connection', (socket) => {
-  console.log('New client connected:', socket.id);
+function getRoomUsers(roomId) {
+  const usersInRoom = roomUsers.get(roomId) || new Map();
+  return Array.from(usersInRoom.entries()).map(([socketId, user]) => ({
+    socketId,
+    userId: user.userId,
+    username: user.name,
+  }));
+}
 
-  socket.on('join-room', (roomId, username) => {
-    socket.join(roomId);
-    console.log(`${username} joined room: ${roomId}`);
+async function ensureRoomMember(roomId, userId) {
+  const room = await Room.findOne({ roomId });
+  if (!room) return null;
 
-    if (!roomUsers.has(roomId)) {
-      roomUsers.set(roomId, new Map());
+  const isMember = room.members.some((memberId) => memberId.toString() === userId);
+  if (!isMember) return null;
+
+  room.lastActivityAt = new Date();
+  await room.save();
+  return room;
+}
+
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+    if (!token) return next(new Error("Authentication required"));
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = await User.findById(decoded.userId).select("-passwordHash");
+    if (!user) return next(new Error("Invalid user"));
+
+    socket.user = {
+      id: user._id.toString(),
+      name: user.name,
+      email: user.email,
+    };
+    next();
+  } catch (error) {
+    next(new Error("Invalid or expired token"));
+  }
+});
+
+io.on("connection", (socket) => {
+  socket.on("join-room", async ({ roomId }) => {
+    try {
+      const room = await ensureRoomMember(roomId, socket.user.id);
+      if (!room) {
+        socket.emit("room-error", { message: "Room not found or unauthorized" });
+        return;
+      }
+
+      socket.join(roomId);
+      if (!roomUsers.has(roomId)) {
+        roomUsers.set(roomId, new Map());
+      }
+
+      roomUsers.get(roomId).set(socket.id, {
+        userId: socket.user.id,
+        name: socket.user.name,
+      });
+
+      socket.emit("code-update", {
+        code: room.code || "// Start coding together!",
+        language: room.language || "javascript",
+        userId: "server",
+      });
+      io.to(roomId).emit("room-users", getRoomUsers(roomId));
+    } catch (error) {
+      socket.emit("room-error", { message: "Could not join room" });
+    }
+  });
+
+  socket.on("code-change", async ({ roomId, code }) => {
+    const room = await ensureRoomMember(roomId, socket.user.id);
+    if (!room) return;
+
+    room.code = code || "";
+    await room.save();
+    socket.to(roomId).emit("code-update", { code: room.code, userId: socket.id });
+  });
+
+  socket.on("language-change", async ({ roomId, language }) => {
+    const room = await ensureRoomMember(roomId, socket.user.id);
+    if (!room) return;
+
+    room.language = language || "javascript";
+    await room.save();
+    socket.to(roomId).emit("language-update", { language: room.language });
+  });
+
+  socket.on("chat-message", async ({ roomId, message }) => {
+    try {
+      const room = await ensureRoomMember(roomId, socket.user.id);
+      if (!room || !message?.text?.trim()) return;
+
+      const savedMessage = await ChatMessage.create({
+        roomId,
+        userId: socket.user.id,
+        userName: socket.user.name,
+        message: message.text.trim(),
+      });
+
+      const payload = {
+        id: savedMessage._id,
+        roomId,
+        userId: socket.user.id,
+        username: socket.user.name,
+        text: savedMessage.message,
+        timestamp: savedMessage.createdAt,
+      };
+
+      io.to(roomId).emit("chat-message", payload);
+    } catch (error) {
+      socket.emit("chat-error", { message: "Message could not be saved" });
+    }
+  });
+
+  socket.on("whiteboard-update", async ({ roomId, state }) => {
+    const room = await ensureRoomMember(roomId, socket.user.id);
+    if (!room) return;
+
+    socket.to(roomId).emit("whiteboard-update", { state, updatedBy: socket.user.id });
+
+    if (whiteboardSaveTimers.has(roomId)) {
+      clearTimeout(whiteboardSaveTimers.get(roomId));
     }
 
-    const usersInRoom = roomUsers.get(roomId);
-    usersInRoom.set(socket.id, username);
-
-    const currentUsers = Array.from(usersInRoom.entries()).map(
-      ([socketId, name]) => ({ socketId, username: name })
+    whiteboardSaveTimers.set(
+      roomId,
+      setTimeout(async () => {
+        await Whiteboard.findOneAndUpdate(
+          { roomId },
+          { roomId, ownerId: room.owner, state, updatedAt: new Date() },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+        whiteboardSaveTimers.delete(roomId);
+      }, 700)
     );
-
-    io.to(roomId).emit('room-users', currentUsers);
   });
 
-  socket.on('code-change', ({ roomId, code }) => {
-    socket.to(roomId).emit('code-update', { code, userId: socket.id });
+  socket.on("whiteboard-clear", async ({ roomId }) => {
+    const room = await ensureRoomMember(roomId, socket.user.id);
+    if (!room) return;
+
+    const state = { strokes: [] };
+    await Whiteboard.findOneAndUpdate(
+      { roomId },
+      { roomId, ownerId: room.owner, state },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    io.to(roomId).emit("whiteboard-update", { state, updatedBy: socket.user.id });
   });
 
-  socket.on('chat-message', ({ roomId, message }) => {
-    socket.to(roomId).emit('chat-message', message);
+  socket.on("run-code", async ({ roomId, language, sourceCode, stdin }) => {
+    try {
+      const room = await ensureRoomMember(roomId, socket.user.id);
+      if (!room) return;
+
+      const result = await executeCode({ language, sourceCode, stdin });
+      io.to(roomId).emit("run-result", {
+        roomId,
+        language,
+        sourceCode,
+        stdin,
+        ...result,
+        runBy: socket.user.name,
+      });
+    } catch (error) {
+      io.to(roomId).emit("run-result", {
+        roomId,
+        language,
+        sourceCode,
+        stdin,
+        stdout: null,
+        stderr: null,
+        status: "Error",
+        error: error.message || "Code execution failed",
+        runBy: socket.user.name,
+      });
+    }
   });
 
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
-
+  socket.on("disconnect", () => {
     for (const [roomId, usersInRoom] of roomUsers.entries()) {
       if (usersInRoom.has(socket.id)) {
         usersInRoom.delete(socket.id);
-
-        const currentUsers = Array.from(usersInRoom.entries()).map(
-          ([socketId, name]) => ({ socketId, username: name })
-        );
-
-        io.to(roomId).emit('room-users', currentUsers);
+        io.to(roomId).emit("room-users", getRoomUsers(roomId));
 
         if (usersInRoom.size === 0) {
           roomUsers.delete(roomId);
@@ -97,81 +247,22 @@ io.on('connection', (socket) => {
       }
     }
   });
+});
 
+async function start() {
+  if (!process.env.MONGO_URI) {
+    console.warn("MONGO_URI is not set. Database-backed routes will not work.");
+  } else {
+    await mongoose.connect(process.env.MONGO_URI);
+    console.log("MongoDB connected");
+  }
 
-  socket.on('run-code', async ({ roomId, language, sourceCode, stdin, runBy }) => {
-    try {
-      const languageId = languageMap[language];
-      if (!languageId) {
-        io.to(roomId).emit('run-result', {
-          roomId,
-          language,
-          sourceCode,
-          stdin,
-          stdout: null,
-          stderr: null,
-          status: 'Error',
-          error: `Unsupported language: ${language}`,
-          runBy,
-        });
-        return;
-      }
-
-      const payload = {
-        source_code: sourceCode,
-        language_id: languageId,
-        stdin: stdin || '',
-      };
-
-      const headers = {};
-      if (JUDGE0_API_KEY) {
-        headers['X-Auth-Token'] = JUDGE0_API_KEY;
-      }
-
-      // Synchronous submission: wait=true so we get result in one call.[web:36]
-      const response = await axios.post(
-        `${JUDGE0_BASE_URL}/submissions?base64_encoded=false&wait=true`,
-        payload,
-        { headers }
-      );
-
-      const data = response.data;
-
-      io.to(roomId).emit('run-result', {
-        roomId,
-        language,
-        sourceCode,
-        stdin,
-        stdout: data.stdout,
-        stderr: data.stderr,
-        status: data.status?.description || 'Unknown',
-        time: data.time || null,
-        memory: data.memory || null,
-        error: null,
-        runBy,
-      });
-    } catch (err) {
-      console.error('Error calling sandbox:', err.message);
-
-      io.to(roomId).emit('run-result', {
-        roomId,
-        language,
-        sourceCode,
-        stdin,
-        stdout: null,
-        stderr: null,
-        status: 'Error',
-        error: 'Sandbox service unavailable',
-        runBy,
-      });
-    }
+  server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
   });
-});
+}
 
-app.get("/", (req, res) => {
-  res.send("Backend is running 🚀");
-});
-
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+start().catch((error) => {
+  console.error("Failed to start server:", error);
+  process.exit(1);
 });
